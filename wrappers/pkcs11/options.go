@@ -64,6 +64,8 @@ func getOpts(opt ...wrapping.Option) (*options, error) {
 				opts.withRsaOaepHash = v
 			case "disable_software_encryption":
 				opts.withDisableSoftwareEncryption = v
+			case "generate_key":
+				opts.withGenerateKey = v
 			}
 		}
 	}
@@ -101,6 +103,7 @@ type options struct {
 	withMechanism                 string
 	withRsaOaepHash               string
 	withDisableSoftwareEncryption string
+	withGenerateKey               string
 }
 
 func getDefaultOptions() options {
@@ -182,6 +185,17 @@ func WithRsaOaepHash(hashMechanisme string) wrapping.Option {
 	return func() interface{} {
 		return OptionFunc(func(o *options) error {
 			o.withRsaOaepHash = hashMechanisme
+			return nil
+		})
+	}
+}
+
+// WithGenerateKey enables automatic key generation on the HSM when no
+// existing key is found matching the configured key_label / key_id.
+func WithGenerateKey(generateKey string) wrapping.Option {
+	return func() interface{} {
+		return OptionFunc(func(o *options) error {
+			o.withGenerateKey = generateKey
 			return nil
 		})
 	}

@@ -71,6 +71,7 @@ type Pkcs11Client struct {
 	mechanism                 uint
 	rsaOaepHash               string
 	disableSoftwareEncryption bool
+	generateKey               bool
 }
 
 type KeyInfo struct {
@@ -96,6 +97,7 @@ const (
 	EnvHsmWrapperMechanism                 = "BAO_HSM_MECHANISM"
 	EnvHsmWrapperRsaOaepHash               = "BAO_HSM_RSA_OAEP_HASH"
 	EnvHsmWrapperDisableSoftwareEncryption = "BAO_HSM_DISABLE_SOFTWARE_ENCRYPTION"
+	EnvHsmWrapperGenerateKey               = "BAO_HSM_GENERATE_KEY"
 )
 
 const (
@@ -108,10 +110,10 @@ const (
 )
 
 func newPkcs11Client(opts *options) (*Pkcs11Client, *wrapping.WrapperConfig, error) {
-	var lib, slot, keyId, tokenLabel, pin, keyLabel, mechanism, rsaOaepHash, softwareEncryption string
+	var lib, slot, keyId, tokenLabel, pin, keyLabel, mechanism, rsaOaepHash, softwareEncryption, generateKeyStr string
 	var slotNum *uint64
 	var mechanismNum uint64
-	var disableSoftwareEncryption bool
+	var disableSoftwareEncryption, generateKey bool
 	var err error
 
 	switch {
@@ -207,6 +209,20 @@ func newPkcs11Client(opts *options) (*Pkcs11Client, *wrapping.WrapperConfig, err
 		}
 	}
 
+	switch {
+	case api.ReadBaoVariable(EnvHsmWrapperGenerateKey) != "" && !opts.Options.WithDisallowEnvVars:
+		generateKeyStr = api.ReadBaoVariable(EnvHsmWrapperGenerateKey)
+	case opts.withGenerateKey != "":
+		generateKeyStr = opts.withGenerateKey
+	}
+
+	if generateKeyStr != "" {
+		generateKey, err = parseutil.ParseBool(generateKeyStr)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
 	if slot != "" {
 		var slotNumRaw uint64
 		if slotNumRaw, err = numberAutoParse(slot, 32); err != nil {
@@ -235,6 +251,7 @@ func newPkcs11Client(opts *options) (*Pkcs11Client, *wrapping.WrapperConfig, err
 		mechanism:                 uint(mechanismNum),
 		rsaOaepHash:               rsaOaepHash,
 		disableSoftwareEncryption: disableSoftwareEncryption,
+		generateKey:               generateKey,
 	}
 	if slotNum != nil {
 		client.slot = new(uint)
@@ -303,7 +320,14 @@ func (c *Pkcs11Client) Encrypt(plaintext []byte) ([]byte, []byte, *Pkcs11Key, er
 	keyId := Pkcs11Key{label: c.keyLabel, id: c.keyId}
 	key, err := c.FindKey(session, keyId)
 	if err != nil {
-		return nil, nil, nil, err
+		if c.generateKey && err.Error() == "no key found" {
+			key, err = c.generateKeyIfNeeded(session)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("generate_key failed: %w", err)
+			}
+		} else {
+			return nil, nil, nil, err
+		}
 	}
 
 	if key.class == pkcs11.CKO_SECRET_KEY && !key.encrypt {
@@ -741,6 +765,107 @@ func (c *Pkcs11Client) ResolveKeyAttrs(session pkcs11.SessionHandle, obj pkcs11.
 		encrypt: encrypt == 1,
 		decrypt: decrypt == 1,
 	}, nil
+}
+
+// GenerateAesKey creates an AES-256 secret key on the HSM with the given
+// label and ID. The key is created with CKA_ENCRYPT and CKA_DECRYPT set to
+// true and CKA_SENSITIVE set to true (non-extractable).
+func (c *Pkcs11Client) GenerateAesKey(session pkcs11.SessionHandle, label string, id string) (*KeyInfo, error) {
+	var template []*pkcs11.Attribute
+	template = append(template, pkcs11.NewAttribute(pkcs11.CKA_TOKEN, true))
+	template = append(template, pkcs11.NewAttribute(pkcs11.CKA_VALUE_LEN, 32)) // AES-256
+	template = append(template, pkcs11.NewAttribute(pkcs11.CKA_ENCRYPT, true))
+	template = append(template, pkcs11.NewAttribute(pkcs11.CKA_DECRYPT, true))
+	template = append(template, pkcs11.NewAttribute(pkcs11.CKA_SENSITIVE, true))
+	template = append(template, pkcs11.NewAttribute(pkcs11.CKA_EXTRACTABLE, false))
+	if label != "" {
+		template = append(template, pkcs11.NewAttribute(pkcs11.CKA_LABEL, []byte(label)))
+	}
+	if keyIdBytes, err := hex.DecodeString(id); err == nil && len(keyIdBytes) != 0 {
+		template = append(template, pkcs11.NewAttribute(pkcs11.CKA_ID, keyIdBytes))
+	}
+
+	mech := []*pkcs11.Mechanism{pkcs11.NewMechanism(pkcs11.CKM_AES_KEY_GEN, nil)}
+	obj, err := c.client.GenerateKey(session, mech, template)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate AES key: %w", err)
+	}
+
+	return &KeyInfo{
+		handle:  obj,
+		class:   pkcs11.CKO_SECRET_KEY,
+		keytype: pkcs11.CKK_AES,
+		encrypt: true,
+		decrypt: true,
+	}, nil
+}
+
+// GenerateRsaKeyPair creates an RSA-4096 key pair on the HSM with the given
+// label and ID. The private key is created with CKA_DECRYPT and CKA_SIGN set
+// to true. The public key is created with CKA_ENCRYPT and CKA_VERIFY set to
+// true.
+func (c *Pkcs11Client) GenerateRsaKeyPair(session pkcs11.SessionHandle, label string, id string) (*KeyInfo, error) {
+	publicExponent := big.NewInt(65537)
+
+	var publicTemplate []*pkcs11.Attribute
+	publicTemplate = append(publicTemplate, pkcs11.NewAttribute(pkcs11.CKA_TOKEN, true))
+	publicTemplate = append(publicTemplate, pkcs11.NewAttribute(pkcs11.CKA_MODULUS_BITS, 4096))
+	publicTemplate = append(publicTemplate, pkcs11.NewAttribute(pkcs11.CKA_PUBLIC_EXPONENT, publicExponent.Bytes()))
+	publicTemplate = append(publicTemplate, pkcs11.NewAttribute(pkcs11.CKA_ENCRYPT, true))
+	publicTemplate = append(publicTemplate, pkcs11.NewAttribute(pkcs11.CKA_VERIFY, true))
+	if label != "" {
+		publicTemplate = append(publicTemplate, pkcs11.NewAttribute(pkcs11.CKA_LABEL, []byte(label)))
+	}
+	if keyIdBytes, err := hex.DecodeString(id); err == nil && len(keyIdBytes) != 0 {
+		publicTemplate = append(publicTemplate, pkcs11.NewAttribute(pkcs11.CKA_ID, keyIdBytes))
+	}
+
+	var privateTemplate []*pkcs11.Attribute
+	privateTemplate = append(privateTemplate, pkcs11.NewAttribute(pkcs11.CKA_TOKEN, true))
+	privateTemplate = append(privateTemplate, pkcs11.NewAttribute(pkcs11.CKA_PRIVATE, true))
+	privateTemplate = append(privateTemplate, pkcs11.NewAttribute(pkcs11.CKA_SENSITIVE, true))
+	privateTemplate = append(privateTemplate, pkcs11.NewAttribute(pkcs11.CKA_EXTRACTABLE, false))
+	privateTemplate = append(privateTemplate, pkcs11.NewAttribute(pkcs11.CKA_DECRYPT, true))
+	privateTemplate = append(privateTemplate, pkcs11.NewAttribute(pkcs11.CKA_SIGN, true))
+	if label != "" {
+		privateTemplate = append(privateTemplate, pkcs11.NewAttribute(pkcs11.CKA_LABEL, []byte(label)))
+	}
+	if keyIdBytes, err := hex.DecodeString(id); err == nil && len(keyIdBytes) != 0 {
+		privateTemplate = append(privateTemplate, pkcs11.NewAttribute(pkcs11.CKA_ID, keyIdBytes))
+	}
+
+	mech := []*pkcs11.Mechanism{pkcs11.NewMechanism(pkcs11.CKM_RSA_PKCS_KEY_PAIR_GEN, nil)}
+	_, _, err := c.client.GenerateKeyPair(session, mech, publicTemplate, privateTemplate)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate RSA key pair: %w", err)
+	}
+
+	// Look up the generated key pair to populate full KeyInfo
+	key := Pkcs11Key{label: label, id: id}
+	return c.FindKey(session, key)
+}
+
+// generateKeyIfNeeded checks if generate_key is enabled and creates the
+// appropriate key type on the HSM based on the configured mechanism.
+func (c *Pkcs11Client) generateKeyIfNeeded(session pkcs11.SessionHandle) (*KeyInfo, error) {
+	var keyType uint = uint(pkcs11.CKK_RSA) // default to RSA
+
+	if c.mechanism != 0 {
+		var err error
+		keyType, err = GetKeyTypeFromMech(c.mechanism)
+		if err != nil {
+			return nil, fmt.Errorf("cannot determine key type for generate_key: %w", err)
+		}
+	}
+
+	switch keyType {
+	case uint(pkcs11.CKK_AES):
+		return c.GenerateAesKey(session, c.keyLabel, c.keyId)
+	case uint(pkcs11.CKK_RSA):
+		return c.GenerateRsaKeyPair(session, c.keyLabel, c.keyId)
+	default:
+		return nil, fmt.Errorf("generate_key: unsupported key type %d", keyType)
+	}
 }
 
 func (c *Pkcs11Client) GetCurrentKey() Pkcs11Key {
